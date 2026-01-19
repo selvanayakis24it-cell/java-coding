@@ -1,0 +1,466 @@
+import React, { useEffect, useState, useRef } from "react";
+
+// Helper utilities
+const uid = () => Math.random().toString(36).slice(2, 9);
+const nowISO = () => new Date().toISOString().slice(0, 16); // 'YYYY-MM-DDTHH:mm'
+
+// Local storage keys
+const LS_KEY = "smart_med_app_v1";
+
+function loadState() {
+  try {
+    const raw = localStorage.getItem(LS_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch (e) {
+    return null;
+  }
+}
+
+function saveState(state) {
+  localStorage.setItem(LS_KEY, JSON.stringify(state));
+}
+
+// Check if two ISO datetime strings are within minutes
+function minutesUntil(isoDatetime) {
+  const t = new Date(isoDatetime).getTime();
+  return Math.round((t - Date.now()) / 60000);
+}
+
+export default function SmartMedicineApp() {
+  // App state
+  const initial = loadState() || {
+    profiles: [
+      { id: "me", name: "Me", isCaregiverView: false },
+    ],
+    selectedProfileId: "me",
+    medicines: [],
+    logs: [], // {id, medId, profileId, timeISO, status: 'taken'|'missed'|'skipped'}
+  };
+
+  const [state, setState] = useState(initial);
+  const [showForm, setShowForm] = useState(false);
+  const [editingMed, setEditingMed] = useState(null);
+  const [query, setQuery] = useState("");
+  const schedulerRef = useRef(null);
+
+  // Persist changes
+  useEffect(() => {
+    saveState(state);
+  }, [state]);
+
+  // Request notification permission on mount
+  useEffect(() => {
+    if (Notification && Notification.permission === "default") {
+      Notification.requestPermission().catch(() => {});
+    }
+  }, []);
+
+  // Lightweight polling scheduler to fire reminders
+  useEffect(() => {
+    function checkReminders() {
+      const medicines = state.medicines;
+      const profiles = state.profiles;
+      const selectedProfile = state.selectedProfileId;
+
+      medicines.forEach((med) => {
+        // Only active medicines for selected profile
+        if (med.profileId !== selectedProfile) return;
+        if (med.archived) return;
+        const today = new Date();
+        const start = med.startDate ? new Date(med.startDate) : null;
+        const end = med.endDate ? new Date(med.endDate) : null;
+        if (start && today < start) return;
+        if (end && today > end) return;
+
+        // For each scheduled time (HH:mm string), build today's datetime and check
+        med.times.forEach((t) => {
+          const [hh, mm] = t.split(":");
+          const dt = new Date();
+          dt.setHours(parseInt(hh, 10));
+          dt.setMinutes(parseInt(mm, 10));
+          dt.setSeconds(0);
+          dt.setMilliseconds(0);
+
+          // If within next minute and not logged yet, notify
+          const mins = Math.round((dt.getTime() - Date.now()) / 60000);
+          // only notify if 0 <= mins < 1 (i.e. now) or within -1 to 1 to allow small jitter
+          if (mins >= -1 && mins <= 0) {
+            // Check if already logged for this med and time today
+            const isoKey = dt.toISOString();
+            const already = state.logs.find(
+              (l) => l.medId === med.id && l.timeISO === isoKey && l.profileId === med.profileId
+            );
+            if (!already) {
+              sendNotification(`Time to take ${med.name}`, med.notes || "");
+              // Auto-create a pending log with status 'missed' that can be updated to 'taken' when user presses button. To avoid marking as missed immediately, we leave it to user to press 'Taken'.
+              // We'll create a 'reminder' log which can later be updated.
+              const log = {
+                id: uid(),
+                medId: med.id,
+                profileId: med.profileId,
+                timeISO: isoKey,
+                status: "pending",
+              };
+              setState((s) => ({ ...s, logs: [...s.logs, log] }));
+            }
+          }
+        });
+      });
+    }
+
+    schedulerRef.current = setInterval(checkReminders, 20000); // every 20s
+    // also run immediately
+    checkReminders();
+    return () => clearInterval(schedulerRef.current);
+  }, [state.medicines, state.logs, state.selectedProfileId]);
+
+  function sendNotification(title, body) {
+    if (window.Notification && Notification.permission === "granted") {
+      try {
+        const n = new Notification(title, { body, tag: "smart-med" });
+        n.onclick = () => window.focus();
+      } catch (e) {
+        // ignore
+      }
+    }
+  }
+
+  // Medicine CRUD
+  function openAddForm() {
+    setEditingMed(null);
+    setShowForm(true);
+  }
+
+  function openEditForm(med) {
+    setEditingMed(med);
+    setShowForm(true);
+  }
+
+  function saveMed(data) {
+    if (data.id) {
+      // update
+      setState((s) => ({
+        ...s,
+        medicines: s.medicines.map((m) => (m.id === data.id ? data : m)),
+      }));
+    } else {
+      data.id = uid();
+      data.profileId = state.selectedProfileId;
+      setState((s) => ({ ...s, medicines: [...s.medicines, data] }));
+    }
+    setShowForm(false);
+  }
+
+  function removeMed(id) {
+    if (!confirm("Delete this medicine?")) return;
+    setState((s) => ({ ...s, medicines: s.medicines.filter((m) => m.id !== id) }));
+  }
+
+  // Logs
+  function markLog(logId, newStatus) {
+    setState((s) => ({
+      ...s,
+      logs: s.logs.map((l) => (l.id === logId ? { ...l, status: newStatus } : l)),
+    }));
+  }
+
+  function quickMark(medId, status) {
+    const dt = new Date();
+    dt.setSeconds(0);
+    dt.setMilliseconds(0);
+    const iso = dt.toISOString();
+    const log = { id: uid(), medId, profileId: state.selectedProfileId, timeISO: iso, status };
+    setState((s) => ({ ...s, logs: [...s.logs, log] }));
+  }
+
+  // Profiles
+  function addProfile(name) {
+    const p = { id: uid(), name };
+    setState((s) => ({ ...s, profiles: [...s.profiles, p], selectedProfileId: p.id }));
+  }
+
+  function selectProfile(id) {
+    setState((s) => ({ ...s, selectedProfileId: id }));
+  }
+
+  // Derived
+  const selectedProfile = state.profiles.find((p) => p.id === state.selectedProfileId) || state.profiles[0];
+  const medsForProfile = state.medicines.filter((m) => m.profileId === selectedProfile.id && !m.archived);
+
+  // adherence calculation (simple): taken / expected in last 30 days
+  function adherenceForProfile(profileId) {
+    const days = 30;
+    const since = Date.now() - days * 24 * 60 * 60 * 1000;
+    const expected = state.medicines
+      .filter((m) => m.profileId === profileId && !m.archived)
+      .reduce((acc, m) => acc + m.times.length * days, 0);
+    if (expected === 0) return 100;
+    const taken = state.logs.filter((l) => l.profileId === profileId && l.status === "taken" && new Date(l.timeISO).getTime() >= since).length;
+    return Math.round((taken / expected) * 100);
+  }
+
+  // UI
+  return (
+    <div className="min-h-screen bg-gray-50 p-6 font-sans text-gray-800">
+      <div className="max-w-5xl mx-auto">
+        <header className="flex items-center justify-between mb-6">
+          <h1 className="text-2xl font-bold">Smart Medicine Reminder — Software Prototype</h1>
+          <div className="flex items-center gap-3">
+            <select
+              value={state.selectedProfileId}
+              onChange={(e) => selectProfile(e.target.value)}
+              className="border rounded px-2 py-1"
+            >
+              {state.profiles.map((p) => (
+                <option value={p.id} key={p.id}>
+                  {p.name}
+                </option>
+              ))}
+            </select>
+            <button
+              className="px-3 py-1 rounded bg-indigo-600 text-white hover:bg-indigo-700"
+              onClick={() => {
+                const nm = prompt("New profile name:");
+                if (nm) addProfile(nm);
+              }}
+            >
+              + Profile
+            </button>
+          </div>
+        </header>
+
+        <main className="grid grid-cols-1 md:grid-cols-3 gap-6">
+          <section className="md:col-span-2 bg-white p-4 rounded shadow">
+            <div className="flex items-center justify-between mb-3">
+              <h2 className="text-lg font-semibold">Medicines for {selectedProfile.name}</h2>
+              <div className="flex gap-2">
+                <input
+                  placeholder="Search..."
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  className="border rounded px-2 py-1"
+                />
+                <button className="px-3 py-1 rounded bg-green-600 text-white" onClick={openAddForm}>
+                  + Add
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-3">
+              {medsForProfile.filter((m) => m.name.toLowerCase().includes(query.toLowerCase())).length === 0 && (
+                <div className="text-sm text-gray-500">No medicines. Add one to get started.</div>
+              )}
+
+              {medsForProfile
+                .filter((m) => m.name.toLowerCase().includes(query.toLowerCase()))
+                .map((m) => (
+                  <div key={m.id} className="p-3 border rounded flex items-start justify-between">
+                    <div>
+                      <div className="font-medium text-lg">{m.name} <span className="text-sm text-gray-500">{m.dose}</span></div>
+                      <div className="text-sm text-gray-600">Times: {m.times.join(", ")} — {m.notes}</div>
+                      <div className="text-sm text-gray-500">{m.startDate ? `From ${m.startDate}` : ""} {m.endDate ? ` to ${m.endDate}` : ""}</div>
+                    </div>
+                    <div className="flex flex-col items-end gap-2">
+                      <div className="flex gap-2">
+                        <button className="px-2 py-1 rounded border" onClick={() => openEditForm(m)}>
+                          Edit
+                        </button>
+                        <button className="px-2 py-1 rounded border text-red-600" onClick={() => removeMed(m.id)}>
+                          Delete
+                        </button>
+                      </div>
+                      <div className="flex gap-2">
+                        <button className="px-2 py-1 rounded bg-blue-600 text-white" onClick={() => quickMark(m.id, "taken")}>
+                          Taken
+                        </button>
+                        <button className="px-2 py-1 rounded bg-yellow-500 text-white" onClick={() => quickMark(m.id, "skipped")}>
+                          Skip
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ))}
+            </div>
+
+            <div className="mt-4 bg-gray-50 p-3 rounded">
+              <h3 className="font-semibold">Recent logs</h3>
+              <div className="space-y-2 mt-2">
+                {state.logs
+                  .filter((l) => l.profileId === selectedProfile.id)
+                  .slice()
+                  .reverse()
+                  .slice(0, 8)
+                  .map((l) => {
+                    const med = state.medicines.find((m) => m.id === l.medId) || { name: "(deleted)" };
+                    return (
+                      <div key={l.id} className="flex items-center justify-between text-sm">
+                        <div>
+                          <strong>{med.name}</strong> — {new Date(l.timeISO).toLocaleString()} • <span className="capitalize">{l.status}</span>
+                        </div>
+                        <div className="flex gap-1">
+                          {l.status !== "taken" && (
+                            <button className="px-2 py-0.5 border rounded" onClick={() => markLog(l.id, "taken")}>
+                              Mark taken
+                            </button>
+                          )}
+                          {l.status !== "missed" && (
+                            <button className="px-2 py-0.5 border rounded" onClick={() => markLog(l.id, "missed")}>
+                              Mark missed
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
+                {state.logs.filter((l) => l.profileId === selectedProfile.id).length === 0 && (
+                  <div className="text-sm text-gray-500">No logs yet.</div>
+                )}
+              </div>
+            </div>
+          </section>
+
+          <aside className="bg-white p-4 rounded shadow">
+            <h2 className="font-semibold">Dashboard</h2>
+            <div className="mt-3 space-y-3 text-sm">
+              <div>Profile: <strong>{selectedProfile.name}</strong></div>
+              <div>Medicines: <strong>{medsForProfile.length}</strong></div>
+              <div>Adherence (30d): <strong>{adherenceForProfile(selectedProfile.id)}%</strong></div>
+
+              <div className="pt-2">
+                <h3 className="font-medium">Quick Actions</h3>
+                <div className="flex flex-col gap-2 mt-2">
+                  <button className="px-3 py-1 rounded bg-indigo-600 text-white" onClick={() => sendNotification("Test reminder", "This is a test")}>
+                    Send test notification
+                  </button>
+                  <button
+                    className="px-3 py-1 rounded border"
+                    onClick={() => {
+                      const sample = {
+                        name: "Vitamin C",
+                        dose: "500 mg",
+                        times: ["09:00", "21:00"],
+                        startDate: new Date().toISOString().slice(0, 10),
+                        endDate: "",
+                        notes: "With food",
+                        archived: false,
+                      };
+                      // prefill form
+                      setEditingMed({ ...sample });
+                      setShowForm(true);
+                    }}
+                  >
+                    Add sample med
+                  </button>
+                </div>
+              </div>
+
+              <div className="pt-3">
+                <h3 className="font-medium">Caregiver Mode</h3>
+                <div className="text-sm">Use profiles to manage family members. Switch profile from the top-right.</div>
+              </div>
+            </div>
+          </aside>
+        </main>
+
+        {/* Form modal */}
+        {showForm && (
+          <div className="fixed inset-0 bg-black/40 flex items-center justify-center">
+            <div className="bg-white rounded shadow-lg w-full max-w-2xl p-4">
+              <h3 className="font-semibold mb-2">{editingMed ? "Edit Medicine" : "Add Medicine"}</h3>
+              <MedForm
+                initial={editingMed}
+                onCancel={() => setShowForm(false)}
+                onSave={(data) => saveMed({ ...data })}
+              />
+            </div>
+          </div>
+        )}
+
+        <footer className="text-center text-sm text-gray-500 mt-6">Prototype — no server. For real deployment, add backend and push notifications.</footer>
+      </div>
+    </div>
+  );
+}
+
+// MedForm component (local)
+function MedForm({ initial, onCancel, onSave }) {
+  const [name, setName] = useState(initial?.name || "");
+  const [dose, setDose] = useState(initial?.dose || "");
+  const [times, setTimes] = useState(initial?.times || ["09:00"]);
+  const [startDate, setStartDate] = useState(initial?.startDate || "");
+  const [endDate, setEndDate] = useState(initial?.endDate || "");
+  const [notes, setNotes] = useState(initial?.notes || "");
+
+  function updateTime(idx, val) {
+    const arr = times.slice();
+    arr[idx] = val;
+    setTimes(arr);
+  }
+  function addTime() {
+    setTimes((t) => [...t, "12:00"]);
+  }
+  function removeTime(i) {
+    setTimes((t) => t.filter((_, idx) => idx !== i));
+  }
+
+  return (
+    <div>
+      <div className="grid grid-cols-2 gap-3">
+        <div>
+          <label className="block text-sm">Medicine name</label>
+          <input value={name} onChange={(e) => setName(e.target.value)} className="border rounded px-2 py-1 w-full" />
+        </div>
+        <div>
+          <label className="block text-sm">Dose</label>
+          <input value={dose} onChange={(e) => setDose(e.target.value)} className="border rounded px-2 py-1 w-full" />
+        </div>
+
+        <div className="col-span-2">
+          <label className="block text-sm">Times</label>
+          <div className="space-y-2 mt-2">
+            {times.map((t, i) => (
+              <div key={i} className="flex gap-2 items-center">
+                <input type="time" value={t} onChange={(e) => updateTime(i, e.target.value)} className="border rounded px-2 py-1" />
+                <button className="px-2 py-1 border rounded" onClick={() => removeTime(i)}>
+                  Remove
+                </button>
+              </div>
+            ))}
+            <button className="px-3 py-1 border rounded" onClick={addTime}>
+              + Add time
+            </button>
+          </div>
+        </div>
+
+        <div>
+          <label className="block text-sm">Start date</label>
+          <input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} className="border rounded px-2 py-1 w-full" />
+        </div>
+        <div>
+          <label className="block text-sm">End date</label>
+          <input type="date" value={endDate} onChange={(e) => setEndDate(e.target.value)} className="border rounded px-2 py-1 w-full" />
+        </div>
+
+        <div className="col-span-2">
+          <label className="block text-sm">Notes</label>
+          <textarea value={notes} onChange={(e) => setNotes(e.target.value)} className="border rounded px-2 py-1 w-full" />
+        </div>
+      </div>
+
+      <div className="mt-4 flex justify-end gap-2">
+        <button className="px-3 py-1 border rounded" onClick={onCancel}>
+          Cancel
+        </button>
+        <button
+          className="px-3 py-1 bg-green-600 text-white rounded"
+          onClick={() => {
+            if (!name) return alert("Please enter medicine name");
+            onSave({ id: initial?.id, name, dose, times, startDate, endDate, notes, archived: false });
+          }}
+        >
+          Save
+        </button>
+      </div>
+    </div>
+  );
+}
